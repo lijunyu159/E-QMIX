@@ -1,0 +1,1413 @@
+import os
+import sys
+import time
+from collections import deque
+from collections import OrderedDict
+
+import numpy as np
+import torch
+import traci
+from gym.spaces import Box, Discrete
+from sumolib import checkBinary
+
+import math
+import sumolib  # NEW: 用于读取 .net.xml 与几何工具
+
+from envs.multiagentenv import MultiAgentEnv
+
+
+class MyIntersectionRandom(MultiAgentEnv):
+    # env of intersection scenario with CAVs of random behaviors.
+    def __init__(self, **kwargs):
+        self.cfg_dir = "D:/heuristic_based_qmix/envs/SUMO_intersection_random_behaviors/main.sumocfg"
+        if "SUMO_HOME" in os.environ:
+            tools = os.path.join(os.environ["SUMO_HOME"], "tools")  # get the path of tools containing traci
+            sys.path.append(tools)
+        else:
+            sys.exit("Please declare environment variable SUMO_HOME")
+
+        self.render = kwargs["render"]
+        if not self.render:
+            self.sumoBinary = checkBinary("sumo")
+        else:
+            self.sumoBinary = checkBinary("sumo-gui")
+        self.sumoCmd = [self.sumoBinary, '-c', self.cfg_dir, '--collision.check-junctions']
+        self.reloadCmd = ["-c", self.cfg_dir]
+        # ----------------------------------------------------------#
+        self.use_multiprocessor = kwargs["multiprocess"]
+        # ----------------------------------------------------------#
+        self.seed = kwargs['seed']
+        self.random_behavior = kwargs["random_behavior"]
+        self.shared_reward = True
+        self.have_own_obs = True
+        self.discrete = kwargs["discrete"]
+        self.comm_lag = kwargs["comm_lag"]
+        self.comm_lag_curricula = kwargs["comm_lag_curricula"]
+        self.env_infos = {"complete_flag": float(False), "collisions": 0.0}
+        self.total_agents = kwargs['total_agents']
+        self.n_agents = kwargs["n_agents"]
+        self.CAVs_id_list = kwargs["CAVs_id_list"]
+        self.min_reward = kwargs["min_reward"]
+        self.max_reward = kwargs["max_reward"]
+        self.use_ppo_like_algo = kwargs["use_ppo"]
+        # ---------------- Global state representation (raster + graph) ---------------- #
+        # state_mode:
+        #   - "flat_obs": legacy behavior (flattened per-agent observations)
+        #   - "raster_graph": build a global BEV raster and an interaction graph
+        self.state_mode = kwargs.get("state_mode", "raster_graph")
+        # If True, get_state() returns a dict with keys: raster, node_feat, adj, node_mask
+        # If False, get_state() returns a flattened 1D vector (compatible with mixers like QMIX).
+        self.state_return_dict = kwargs.get("state_return_dict", False)
+
+        # Raster (BEV) configuration
+        self.raster_size = int(kwargs.get("raster_size", 64))  # H=W=raster_size
+        self.raster_range_m = float(kwargs.get("raster_range_m", 60.0))  # covers [-range, +range] around junction center
+        self.vehicle_stamp = kwargs.get("vehicle_stamp", "rectangle")  # "rectangle" | "point"
+        self.raster_channels = int(kwargs.get("raster_channels", 5))
+
+        # Graph configuration
+        self.graph_max_nodes = int(kwargs.get("graph_max_nodes", self.total_agents))
+        self.graph_edge_dist_m = float(kwargs.get("graph_edge_dist_m", 35.0))
+        self.graph_edge_sigma = float(kwargs.get("graph_edge_sigma", 15.0))
+        self.graph_include_self_edges = bool(kwargs.get("graph_include_self_edges", False))
+
+        # Internal cached raster layers
+        self._junction_center_xy = None  # (cx, cy)
+        self._junction_poly = None
+        self._junction_raster_mask = None
+        # --------------- communication lag related variables -----------------#
+        # obs: (x, y, v, safe_distance, waiting_time, enter_flag, leave_flag)
+        self.obs_temp = {"pos": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "speed": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "min_dist": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "wt": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "enter_flag": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "leave_flag": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         }
+
+        self.routes_random_all = ["route_WE", "route_WN", "route_WS",
+                                  "route_EW", "route_ES", "route_EN",
+                                  "route_NE", "route_NS", "route_NW",
+                                  "route_SW", "route_SN", "route_SE"]
+        self.routes_fixed = {"0": "route_WS", "1": "route_WE",
+                             "6": "route_SW", "7": "route_SN",
+                             "3": "route_ES", "2": "route_EW",
+                             "4": "route_NE", "5": "route_NS"}
+        # self.same_directions = {"W": ("0", "1"), "E": ("2", "3"), "N": ("4", "5"), "S": ("6", "7")}
+        self.same_directions = {"0": "1", "1": "0",
+                                "2": "3", "3": "2",
+                                "4": "5", "5": "4",
+                                "6": "7", "7": "6"}
+        # The first element is the major route
+        self.routes_of_vehicles = {"0": ["route_WE", "route_WS"], "1": ["route_WN", "route_WE"],
+                                   "6": ["route_SW", "route_SN"], "7": ["route_SN", "route_SE"],
+                                   "3": ["route_ES", "route_EW"], "2": ["route_EW", "route_EN"],
+                                   "4": ["route_NE", "route_NS"], "5": ["route_NS", "route_NW"]}
+        self.intention_dim = 2
+        self.intention_probs = kwargs["intention_probs"]
+        self.veh_intentions = OrderedDict({})
+        self.departSpeed = kwargs["depart_speed"]
+        self.type_name = "VehicleA"  # "vehicle.tesla.model3"
+        self.vehicle_spawn_infos = {"depart": "now", "departPos": "30.0", "departSpeed": str(self.departSpeed),
+                                    "departLane": "best"}
+        self.CAVs_departLane = {"0": "L6_0", "1": "L6_1",
+                                "2": "L2_0", "3": "L2_1",
+                                "4": "L0_1", "5": "L0_0",
+                                "6": "L4_1", "7": "L4_0"}
+        # self.virtual_signal_pair = {1: ("L0_0", "L4_0"), 2: ("L0_1", "L4_1"),
+        #                             3: ("L6_0", "L2_0"), 4: ("L6_1", "L2_1")}
+        self.virtual_signal_veh_pair = OrderedDict({0: ("5", "7"), 1: ("4", "6"),
+                                        2: ("0", "2"), 3: ("1", "3")})
+        self.virtual_signal_veh_pair_general = OrderedDict({0: ("route_NS", "route_NW", "route_SN", "route_SE"),
+                                                            1: ("route_SW", "route_NE"),
+                                                            2: ("route_WE", "route_WS", "route_EW", "route_EN"),
+                                                            3: ("route_WN", "route_ES")})
+        self.selected_routes_of_vehicles = OrderedDict({vehID: [] for vehID in self.CAVs_id_list})
+        # self.virtual_signal_veh_pair = OrderedDict({0: ("6", "7"), 1: ("1", "0"),
+        #                                 2: ("5", "4"), 3: ("2", "3")}) # all-lanes mode
+        # self.virtual_signal_veh_pair = OrderedDict({0: ("4", "6"), 1: ("5", "7"),
+        #                                             2: ("1", "3"), 3: ("0", "2")})
+        self.signal_cycle_length = kwargs["signal_cycle_length"]
+        self.use_virtual_signal = kwargs["use_virtual_signal"]
+        self.time_step = kwargs["time_step"]  # 0.1
+        self.decision_freq = kwargs["decision_freq"]
+        self.signal_cycle_num = self.signal_cycle_length
+        self.run_curricula = kwargs["run_curricula"]
+        self.phase = None
+        if self.run_curricula:
+            self.phase = kwargs["phase"]
+        # self.action_discretization = kwargs["action_discretization"]
+        self.full_id_list = tuple([str(i) for i in range(self.n_agents)])
+        self.max_speed = 15
+        self.max_lane_length = 99
+        self.render_step_time = kwargs["time_step_for_render"]
+        self.time_step_for_render = self.render_step_time if self.render else 0.0
+        # self.accel_dim = 2
+        # self.decel_dim = self.accel_dim
+        # self.action_dim_per_veh = 3  # accelerate, keep constant speed, decelerate
+        self.action_pattern = kwargs["action_pattern"]
+        self.accel_res = kwargs["acceleration_resolution_pattern_" + str(self.action_pattern)]
+        self.action_dim_per_veh = 2 * len(self.accel_res) + 1  # accelerate, keep constant speed, decelerate
+        self.accel_step = 5
+        self.ways_num = 4
+
+        self.lane_ids = ["L0_0", "L0_1", "L1_0", "L1_1", "L2_0", "L2_1", "L3_0", "L3_1",
+                         "L4_0", "L4_1", "L5_0", "L5_1", "L6_0", "L6_1", "L7_0", "L7_1", ]
+        self.lane_ids_follow_vehID = ["L6_1", "L6_0", "L4_1", "L4_0", "L2_1", "L2_0", "L0_1", "L0_0"]
+        self.junction_name = 'J1'
+        # --------episode_limit: -------#
+        self.episode_limit = kwargs["episode_limit"]
+        # ------------------------------#
+        self.waiting_steps_threshold = int(self.episode_limit / 2)
+        self.safe_dist = 5.0  # greater means safer
+        self.caution_dist = 2 * self.safe_dist
+        self.v_threshold = 2 / self.max_speed
+        self.vehicles_through = 0
+        self.complete_flag = False
+        # self.lane_ids = traci.lane.getIDlist()[self.ways_num*2:]
+
+        # ----------------------------------------------------------------------#
+        self.step_num = 0 #kwargs["time_step"]
+        self.episode_num = 0
+        self.done = False
+        self.collision_times = 0
+        # self.enter_flag_list_tmp = [False for _ in range(self.n_agents)]
+        # self.leave_flag_list_tmp = [False for _ in range(self.n_agents)]
+        # self.enter_flag_list = [False for _ in range(self.n_agents)]
+        # self.leave_flag_list = [False for _ in range(self.n_agents)]
+        self.enter_flag_dict_tmp = {str(t): False for t in range(self.total_agents)}
+        self.leave_flag_dict_tmp = {str(t): False for t in range(self.total_agents)}
+        self.enter_flag_dict = {str(t): False for t in range(self.total_agents)}
+        self.leave_flag_dict = {str(t): False for t in range(self.total_agents)}
+        # ======================================== action space definition ===========================================#
+        if self.discrete:
+            self.action_space = [Discrete(self.action_dim_per_veh) for _ in range(self.n_agents)]
+        else:
+            self.action_space = Box(
+                low=np.array([0 for _ in range(self.n_agents)]),
+                high=np.array([self.max_speed for _ in range(self.n_agents)]),
+                dtype=np.float64
+            )  # action_space.sample
+
+        # ================================== observation space definition: (x,y,v) for each agent ======================================#
+        self.pos_related_dim = 2
+        self.vel_end_idx = 3
+        self.safe_dist_idx = 4
+        self.wt_dim_idx = 5
+        self.enter_flag_idx = 6
+        self.leave_flag_idx = 7
+        self.extra_obs_dim = 3
+        self.obs_dim_per_veh = self.leave_flag_idx + self.extra_obs_dim
+        # self.obs_dim_per_veh = self.leave_flag_idx
+
+        self.observation_space = Box(
+            low=np.array([[0 for _ in range(self.obs_dim_per_veh)] for _ in range(self.total_agents)]).reshape(
+                self.obs_dim_per_veh * self.total_agents),
+            high=np.array(
+                [[float("inf"), float("inf"), self.max_speed, float("inf"), float("inf"), 1.0, 1.0, 0.0, 0.0, 0.0] for _
+                 in range(self.total_agents)]).reshape(
+                self.obs_dim_per_veh * self.total_agents),
+            dtype=np.float64
+        )
+
+    def get_env_info(self):
+        env_info = {"state_shape": self.get_state_size(),
+                    "obs_shape": self.get_obs_size(),
+                    "n_actions": self.get_total_actions(),
+                    "n_agents": self.total_agents,
+                    "episode_limit": self.episode_limit}
+        return env_info
+
+    def get_stats(self):
+        # stats = {
+        #     "complete_flag": self.complete_flag,
+        #     "collisions": self.collision_times
+        # }
+        stats = {}
+        return stats
+
+    def step(self, actions):
+        """ Returns reward, terminated, info """
+        # wait all vehicles
+        self.curr_ID_list = traci.vehicle.getIDList()
+        # decide if the vehicle has entered or left the intersection
+        self._set_enter_and_leave_flags()
+        actions = torch.from_numpy(actions)
+        if self.use_ppo_like_algo:
+            actions = actions.cpu().numpy() if self.use_multiprocessor else actions # for ippo testing
+        else:
+            actions = actions.cpu().numpy() if not self.use_multiprocessor else actions  # comment out for parallel runner
+        self._apply_actions(actions)
+        traci.simulationStep(self.time_step * self.step_num) # self.time_step * self.step_num
+        # traci.simulationStep()
+        self.step_num += 1
+        time.sleep(self.time_step_for_render)  # can be commented out when there is no need for gui
+        # update the comm-related information
+        self._update_info()
+        next_observations = self.get_obs()
+        rewards = self._get_shared_reward(next_observations) if self.shared_reward else self._get_rewards(
+            next_observations)
+        # rewards = np.clip(rewards, self.min_reward, self.max_reward)
+        # print(rewards)
+        done = self._get_done()
+        # complete_flag = self._if_complete_task()
+        return rewards, done, self.env_infos
+
+    def _apply_actions(self, actions):
+        # action is either list or np.array, if discrete, its dimension is [n_agents, action_dim]
+        # assert isinstance(actions, list) or isinstance(actions, np.ndarray)
+        # curr_ID_list = traci.vehicle.getIDList()
+        if self.discrete:  # discrete action space
+            for id_idx, id in enumerate(self.CAVs_id_list):
+                if id not in self.curr_ID_list:
+                    continue
+                # id_idx = self.CAVs_id_list.index(id)
+                traci.vehicle.setLaneChangeMode(id, 512)
+                traci.vehicle.setSpeedMode(id, 32)
+                curr_veh_speed = traci.vehicle.getSpeed(id)
+                # speed = self._derive_speed_from_discrete_actions(id, actions)
+                # accel = self._derive_accel_from_discrete_actions(id, actions) ##### serve for test_env
+                # accel = self._derive_accel_from_chosen_actions_idxes(id_idx, actions[0]) # for IPPO testing
+                accel = self._derive_accel_from_chosen_actions_idxes(id_idx, actions)  ##### serve for QMIX main algo
+                speed = np.clip(curr_veh_speed + accel * self.time_step, a_min=0, a_max=self.max_speed)
+                traci.vehicle.setSpeed(vehID=id, speed=speed)
+        else:  # continuous action space
+            for id_idx, id in enumerate(self.curr_ID_list):
+                # id_idx = self.CAVs_id_list.index(id)
+                # todo: handle the case when id is not in the current vehicle lists
+                traci.vehicle.setLaneChangeMode(id, 512)
+                traci.vehicle.setSpeedMode(id, 32)
+                traci.vehicle.setSpeed(vehID=id, speed=actions[id_idx])
+
+    def _update_info(self):
+        # obs: (x, y, v, safe_distance, waiting_time, enter_flag, leave_flag)
+        # self.obs_temp = {"pos": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "speed": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "min_dist": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "wt": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "enter_flag": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "leave_flag": [deque(maxlen=100) for _ in range(self.n_agents)]}
+        wt = 0
+        # curr_ID_list = traci.vehicle.getIDList()
+        for lane_id in self.lane_ids:
+            wt += traci.lane.getWaitingTime(lane_id)
+        self.curr_ID_list = traci.vehicle.getIDList()
+
+        for id_idx, id in enumerate(self.CAVs_id_list):
+            if id not in self.curr_ID_list:
+                continue
+            pos = list(traci.vehicle.getPosition(id))
+            speed = traci.vehicle.getSpeed(id)
+            self.obs_temp["pos"][id].append(pos)
+            self.obs_temp["speed"][id].append(speed)
+            dist_list = self._get_distance_list_between_ego_and_other_vehicles(id, exclude_same_phase=True)
+            if min(dist_list) <= self.safe_dist:  # bit 3
+                self.obs_temp["min_dist"][id].append(min(dist_list) / self.safe_dist)
+            else:
+                self.obs_temp["min_dist"][id].append(1.0)
+            self.obs_temp["wt"][id].append(wt)
+            self.obs_temp["enter_flag"][id].append(1.0 if self.enter_flag_dict[id] else 0.0)
+            self.obs_temp["leave_flag"][id].append(1.0 if self.leave_flag_dict[id] else 0.0)
+
+    def get_obs(self):
+        """ Returns all agent observations in a list """
+        observations = np.array(self._get_raw_observations(), dtype=np.float64)
+        observations = self._normalize_observation_by_max(observations)
+        return observations
+
+    def _get_raw_observations(self):
+        """
+        each bit of observations:
+        (x, y, v, safe_distance, waiting_time, enter_flag, leave_flag)
+
+        if consider communication delay, then get observation from the following data structure:
+        # self.obs_temp = {"pos": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "speed": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "min_dist": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "wt": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "enter_flag": [deque(maxlen=100) for _ in range(self.n_agents)],
+        #                  "leave_flag": [deque(maxlen=100) for _ in range(self.n_agents)]}
+        """
+        # observations = [[0 for _ in range(self.obs_dim_per_veh)] for _ in range(self.total_agents)]
+        observations = {str(t): [0 for _ in range(self.obs_dim_per_veh)] for t in range(self.total_agents)}
+        wt = 0
+        # curr_ID_list = traci.vehicle.getIDList()
+        for id in self.lane_ids:
+            wt += traci.lane.getWaitingTime(id)
+
+        self.curr_ID_list = traci.vehicle.getIDList()
+        for id_idx, id in enumerate(self.CAVs_id_list):
+            # set the random route bit:
+            observations[id][self.leave_flag_idx] = float(self.veh_intentions[id])
+            # id_idx = self.CAVs_id_list.index(id)
+            if id not in self.curr_ID_list:
+                continue
+            # print("step is: ",self.step_num, 'current ID list: ', self.curr_ID_list, "the position info: ", traci.vehicle.getPosition(id))
+            # get (x,y,v) for each vehicle
+            if not self.comm_lag:  # when there is no communication lag:
+                if traci.vehicle.getPosition(id):  # if get the state information
+                    observations[id][:self.pos_related_dim] = list(traci.vehicle.getPosition(id))  # bit 0,1
+                    observations[id][self.vel_end_idx - 1] = traci.vehicle.getSpeed(id)  # bit 2
+                # process safe distance
+                dist_list = self._get_distance_list_between_ego_and_other_vehicles(id, exclude_same_phase=True)
+                if not dist_list:  # bit 3
+                    observations[id][self.safe_dist_idx - 1] = 1.0
+                elif min(dist_list) <= self.safe_dist:
+                    observations[id][self.safe_dist_idx - 1] = min(dist_list) / self.safe_dist
+                else:
+                    observations[id][self.safe_dist_idx - 1] = 1.0
+
+                observations[id][self.wt_dim_idx - 1] = wt  # bit 4
+                observations[id][self.enter_flag_idx - 1] = 1.0 if self.enter_flag_dict[id] else 0.0  # bit 5
+                observations[id][self.leave_flag_idx - 1] = 1.0 if self.leave_flag_dict[id] else 0.0  # bit 6
+            else:  # when there are communication lags
+                # todo: use the delayed information as observation
+                cur_length = len(self.obs_temp["pos"][id])
+                observations[id][:self.pos_related_dim] = self.obs_temp["pos"][id][0] \
+                    if len(self.obs_temp["pos"][id]) <= self.comm_lag else \
+                    self.obs_temp["pos"][id][np.random.randint(-1 - int(abs(self.comm_lag)), 0)]  # bit 0,1
+                observations[id][self.vel_end_idx - 1] = self.obs_temp["speed"][id][0] \
+                    if len(self.obs_temp["speed"][id]) <= self.comm_lag \
+                    else self.obs_temp["speed"][id][np.random.randint(-1 - int(abs(self.comm_lag)), 0)]  # bit 2
+                observations[id][self.safe_dist_idx - 1] = self.obs_temp["min_dist"][id][0] \
+                    if len(self.obs_temp["min_dist"][id]) <= self.comm_lag \
+                    else self.obs_temp["min_dist"][id][np.random.randint(-1 - int(abs(self.comm_lag)), 0)]
+                observations[id][self.wt_dim_idx - 1] = self.obs_temp["wt"][id][0] \
+                    if len(self.obs_temp["wt"][id]) <= self.comm_lag \
+                    else self.obs_temp["wt"][id][np.random.randint(-1 - int(abs(self.comm_lag)), 0)]  # bit 4
+                observations[id][self.enter_flag_idx - 1] = self.obs_temp["enter_flag"][id][0] \
+                    if len(self.obs_temp["enter_flag"][id]) <= self.comm_lag \
+                    else self.obs_temp["enter_flag"][id][
+                    np.random.randint(-1 - int(abs(self.comm_lag)), 0)]  # bit 5
+                observations[id][self.leave_flag_idx - 1] = self.obs_temp["leave_flag"][id][0] \
+                    if len(self.obs_temp["leave_flag"][id]) <= self.comm_lag \
+                    else self.obs_temp["leave_flag"][id][
+                    np.random.randint(-1 - int(abs(self.comm_lag)), 0)]  # bit 6
+        raw_obs = []
+        for id, obs in observations.items():
+            raw_obs.append(obs)
+        return raw_obs
+
+    def _normalize_observation_by_max(self, raw_obs):  # raw_obs: [8, obs_dim]
+        # obs_nmlz = []
+        for idv_obs in raw_obs:  # raw_obs is numpy.array
+            idv_obs[:self.pos_related_dim] /= self.max_lane_length
+            idv_obs[self.vel_end_idx - 1] /= self.max_speed
+            if idv_obs[self.wt_dim_idx - 1] >= self.waiting_steps_threshold:
+                idv_obs[self.wt_dim_idx - 1] = 1.0
+            else:
+                idv_obs[self.wt_dim_idx - 1] /= self.waiting_steps_threshold
+            # obs_cat = np.concatenate((pos, [vel], idv_obs[self.vel_end_idx:])).tolist()
+            # obs_nmlz.append(obs_cat)
+        # return raw_obs.tolist()
+        return raw_obs
+
+    def get_obs_agent(self, agent_id):
+        """ Returns observation for agent_id """
+        obs_agent = self.get_obs()[agent_id]
+        return obs_agent
+
+    def get_obs_size(self):
+        """ Returns the shape of the observation """
+        return int(self.observation_space.shape[0] / self.total_agents)
+
+    def get_state(self):
+        """Return a global state.
+
+        - If state_mode == "flat_obs": legacy flattened per-agent observation vector.
+        - If state_mode == "raster_graph":
+            * if state_return_dict: returns dict {raster, node_feat, adj, node_mask}
+            * else: returns a flattened vector (1, state_dim)
+        """
+        if getattr(self, "state_mode", "flat_obs") == "flat_obs":
+            state = np.array(self.get_obs()).reshape((1, -1))  # [1, n_agents*obs_dim]
+            if state.size == 0:
+                state = np.zeros((1, self.n_agents * self.obs_dim_per_veh), dtype=np.float32)
+            return state.astype(np.float32)
+
+        state_dict = self._get_raster_graph_state()
+        if self.state_return_dict:
+            return state_dict
+
+        # Flatten for compatibility with algorithms expecting a single vector state
+        raster = state_dict["raster"].reshape(-1)
+        node_feat = state_dict["node_feat"].reshape(-1)
+        adj = state_dict["adj"].reshape(-1)
+        node_mask = state_dict["node_mask"].reshape(-1)
+        flat = np.concatenate([raster, node_feat, adj, node_mask], axis=0).astype(np.float32)
+        return flat.reshape(1, -1)
+
+    def get_state_size(self):
+        """Returns the flattened state size (int).
+
+        Note: if state_return_dict=True, the returned state is a dict; most frameworks won't call get_state_size().
+        We still return the flattened size for convenience.
+        """
+        if getattr(self, "state_mode", "flat_obs") == "flat_obs":
+            return int(self.observation_space.shape[0])
+
+        # raster: C*H*W
+        C = int(getattr(self, "raster_channels", 5))
+        H = int(getattr(self, "raster_size", 64))
+        W = H
+        raster_dim = C * H * W
+
+        # graph: node_feat (N*F) + adj (N*N) + node_mask (N)
+        N = int(getattr(self, "graph_max_nodes", self.total_agents))
+        F = 10  # must match _build_graph() output feature dimension
+        graph_dim = N * F + N * N + N
+
+        return int(raster_dim + graph_dim)
+
+    # ---------------- Raster + Graph global state builders ---------------- #
+
+    def _get_raster_graph_state(self):
+        """Build and return raster + graph representation of the current SUMO scene."""
+        raster = self._build_raster()
+        node_feat, adj, node_mask = self._build_graph()
+        return {
+            "raster": raster,           # (C, H, W) float32
+            "node_feat": node_feat,     # (N, F) float32
+            "adj": adj,                 # (N, N) float32
+            "node_mask": node_mask,     # (N,) float32 (0/1)
+        }
+
+    def _ensure_junction_cache(self):
+        """Ensure junction polygon, center, and static raster mask are prepared."""
+        if getattr(self, "shape_intersection", None) is None:
+            return False
+
+        poly = [(float(p[0]), float(p[1])) for p in self.shape_intersection]
+        # Cache polygon and center (bbox center is robust for convex/concave shapes)
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        cx = 0.5 * (min(xs) + max(xs))
+        cy = 0.5 * (min(ys) + max(ys))
+
+        if self._junction_poly != poly or self._junction_center_xy is None:
+            self._junction_poly = poly
+            self._junction_center_xy = (cx, cy)
+            self._junction_raster_mask = None  # invalidate cached mask
+
+        if self._junction_raster_mask is None:
+            self._junction_raster_mask = self._rasterize_polygon_mask(poly).astype(np.float32)
+
+        return True
+
+    def _build_raster(self):
+        """Return BEV raster tensor of shape (C, H, W)."""
+        H = W = int(self.raster_size)
+        C = int(self.raster_channels)
+        raster = np.zeros((C, H, W), dtype=np.float32)
+
+        if not self._ensure_junction_cache():
+            return raster
+
+        # Channel 0: junction static mask
+        if C >= 1:
+            raster[0] = self._junction_raster_mask
+
+        cx, cy = self._junction_center_xy
+        vehicle_ids = traci.vehicle.getIDList()
+
+        # Prepare helper: inside junction test
+        poly = self._junction_poly
+
+        for vid in vehicle_ids:
+            pos = traci.vehicle.getPosition(vid)
+            if not pos:
+                continue
+            x, y = float(pos[0]), float(pos[1])
+            gi, gj = self._world_to_grid(x, y, cx, cy)
+            if gi is None:
+                continue
+
+            # Determine channels
+            is_cav = 1.0 if vid in self.CAVs_id_list else 0.0
+            v = float(traci.vehicle.getSpeed(vid))
+            v_norm = float(np.clip(v / max(1e-6, self.max_speed), 0.0, 1.0))
+            in_junc = 1.0 if self._point_in_poly((x, y), poly) else 0.0
+
+            # Occupancy stamping
+            if self.vehicle_stamp == "rectangle":
+                self._stamp_vehicle_rectangle(raster, vid, cx, cy, is_cav, v_norm, in_junc)
+            else:
+                # point stamp: 3x3 neighborhood
+                for di in (-1, 0, 1):
+                    for dj in (-1, 0, 1):
+                        ii = gi + di
+                        jj = gj + dj
+                        if 0 <= ii < H and 0 <= jj < W:
+                            if C >= 2:
+                                raster[1, ii, jj] = 1.0
+                            if C >= 3 and is_cav > 0.5:
+                                raster[2, ii, jj] = 1.0
+                            if C >= 4:
+                                raster[3, ii, jj] = max(raster[3, ii, jj], v_norm)
+                            if C >= 5:
+                                raster[4, ii, jj] = max(raster[4, ii, jj], in_junc)
+
+        return raster
+
+    def _build_graph(self):
+        """Build interaction graph over (up to) graph_max_nodes CAVs.
+
+        Nodes are aligned with self.CAVs_id_list order (truncated/padded).
+        """
+        N = int(self.graph_max_nodes)
+        # Feature dim must match get_state_size()
+        F = 10
+        node_feat = np.zeros((N, F), dtype=np.float32)
+        node_mask = np.zeros((N,), dtype=np.float32)
+        adj = np.zeros((N, N), dtype=np.float32)
+
+        if not self._ensure_junction_cache():
+            return node_feat, adj, node_mask
+
+        cx, cy = self._junction_center_xy
+        poly = self._junction_poly
+        present_ids = set(traci.vehicle.getIDList())
+
+        # Build node features
+        used_ids = list(self.CAVs_id_list)[:N]
+        positions = np.zeros((N, 2), dtype=np.float32)
+
+        for i, vid in enumerate(used_ids):
+            if vid not in present_ids:
+                continue
+
+            pos = traci.vehicle.getPosition(vid)
+            if not pos:
+                continue
+            x, y = float(pos[0]), float(pos[1])
+            positions[i] = [x, y]
+            node_mask[i] = 1.0
+
+            dx = (x - cx) / max(1e-6, self.raster_range_m)
+            dy = (y - cy) / max(1e-6, self.raster_range_m)
+            v = float(traci.vehicle.getSpeed(vid))
+            v_norm = float(np.clip(v / max(1e-6, self.max_speed), 0.0, 1.0))
+
+            ang_deg = float(traci.vehicle.getAngle(vid))
+            ang = math.radians(ang_deg)
+            sin_h = math.sin(ang)
+            cos_h = math.cos(ang)
+
+            in_junc = 1.0 if self._point_in_poly((x, y), poly) else 0.0
+            is_cav = 1.0  # nodes are CAVs by construction
+
+            enter_flag = 1.0 if getattr(self, "enter_flag_dict", {}).get(vid, False) else 0.0
+            leave_flag = 1.0 if getattr(self, "leave_flag_dict", {}).get(vid, False) else 0.0
+            intention = float(getattr(self, "veh_intentions", {}).get(vid, 0.0))
+
+            node_feat[i] = np.array([dx, dy, v_norm, sin_h, cos_h, in_junc, is_cav, enter_flag, leave_flag, intention],
+                                    dtype=np.float32)
+
+        # Build adjacency (distance-thresholded, weighted)
+        sigma = max(1e-6, float(self.graph_edge_sigma))
+        dist_th = float(self.graph_edge_dist_m)
+
+        for i in range(N):
+            if node_mask[i] < 0.5:
+                continue
+            xi, yi = float(positions[i, 0]), float(positions[i, 1])
+            for j in range(N):
+                if node_mask[j] < 0.5:
+                    continue
+                if i == j:
+                    if self.graph_include_self_edges:
+                        adj[i, j] = 1.0
+                    continue
+                xj, yj = float(positions[j, 0]), float(positions[j, 1])
+                d = math.hypot(xi - xj, yi - yj)
+                if d <= dist_th:
+                    adj[i, j] = math.exp(-d / sigma)
+
+        return node_feat, adj, node_mask
+
+    # ---------------- Geometry / raster utilities ---------------- #
+
+    def _world_to_grid(self, x, y, cx, cy):
+        """Map world (x,y) to raster indices (i,j). Return (None,None) if out of bounds."""
+        H = W = int(self.raster_size)
+        rng = float(self.raster_range_m)
+        # convert to local coords relative to junction center
+        lx = x - cx
+        ly = y - cy
+        if lx < -rng or lx > rng or ly < -rng or ly > rng:
+            return None, None
+
+        # grid: i increases downward, j increases rightward
+        res = (2.0 * rng) / float(H)
+        j = int((lx + rng) / res)
+        i = int((rng - ly) / res)  # y up -> i down
+
+        if 0 <= i < H and 0 <= j < W:
+            return i, j
+        return None, None
+
+    def _grid_to_world(self, i, j, cx, cy):
+        """Raster cell center (i,j) -> world (x,y)."""
+        H = W = int(self.raster_size)
+        rng = float(self.raster_range_m)
+        res = (2.0 * rng) / float(H)
+        x = cx + (-rng + (j + 0.5) * res)
+        y = cy + (rng - (i + 0.5) * res)
+        return x, y
+
+    def _rasterize_polygon_mask(self, poly):
+        """Rasterize a polygon into a (H,W) mask with 1 inside polygon."""
+        H = W = int(self.raster_size)
+        mask = np.zeros((H, W), dtype=np.float32)
+        cx, cy = self._junction_center_xy
+
+        # Loop over all cells; H,W are small (e.g., 64), so this is acceptable.
+        for i in range(H):
+            for j in range(W):
+                x, y = self._grid_to_world(i, j, cx, cy)
+                if self._point_in_poly((x, y), poly):
+                    mask[i, j] = 1.0
+        return mask
+
+    def _point_in_poly(self, point_xy, poly):
+        """Return True if point is inside polygon poly."""
+        # sumolib provides robust geometry helpers
+        try:
+            return bool(sumolib.geomhelper.isPointInPolygon(point_xy, poly))
+        except Exception:
+            # Fallback: ray casting
+            x, y = point_xy
+            inside = False
+            n = len(poly)
+            for i in range(n):
+                x1, y1 = poly[i]
+                x2, y2 = poly[(i + 1) % n]
+                if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1):
+                    inside = not inside
+            return inside
+
+    def _stamp_vehicle_rectangle(self, raster, vid, cx, cy, is_cav, v_norm, in_junc):
+        """Stamp a rotated rectangle footprint of a vehicle onto raster channels."""
+        H = W = int(self.raster_size)
+        C = int(self.raster_channels)
+        pos = traci.vehicle.getPosition(vid)
+        if not pos:
+            return
+        x, y = float(pos[0]), float(pos[1])
+
+        # Vehicle geometry (fallback to point if unavailable)
+        try:
+            length = float(traci.vehicle.getLength(vid))
+            width = float(traci.vehicle.getWidth(vid))
+            if length <= 0 or width <= 0:
+                raise ValueError
+        except Exception:
+            gi, gj = self._world_to_grid(x, y, cx, cy)
+            if gi is None:
+                return
+            if C >= 2:
+                raster[1, gi, gj] = 1.0
+            if C >= 3 and is_cav > 0.5:
+                raster[2, gi, gj] = 1.0
+            if C >= 4:
+                raster[3, gi, gj] = max(raster[3, gi, gj], v_norm)
+            if C >= 5:
+                raster[4, gi, gj] = max(raster[4, gi, gj], in_junc)
+            return
+
+        ang_deg = float(traci.vehicle.getAngle(vid))
+        theta = math.radians(ang_deg)
+        c = math.cos(theta)
+        s = math.sin(theta)
+
+        dx = 0.5 * length
+        dy = 0.5 * width
+
+        # corners in vehicle frame
+        corners = [(-dx, -dy), (-dx, dy), (dx, dy), (dx, -dy)]
+        poly = []
+        for px, py in corners:
+            wx = x + c * px - s * py
+            wy = y + s * px + c * py
+            poly.append((wx, wy))
+
+        # bounding box in grid indices to limit checks
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        min_i, min_j = self._world_to_grid(min(xs), max(ys), cx, cy)  # top-left approx
+        max_i, max_j = self._world_to_grid(max(xs), min(ys), cx, cy)  # bottom-right approx
+
+        if min_i is None or max_i is None:
+            # vehicle might be partially out of raster range
+            # clamp by converting all corners and taking min/max indices that are valid
+            ij = [self._world_to_grid(px, py, cx, cy) for px, py in poly]
+            ij = [(ii, jj) for ii, jj in ij if ii is not None]
+            if not ij:
+                return
+            is_ = [ii for ii, _ in ij]
+            js_ = [jj for _, jj in ij]
+            min_i, max_i = min(is_), max(is_)
+            min_j, max_j = min(js_), max(js_)
+        else:
+            min_i, max_i = sorted([min_i, max_i])
+            min_j, max_j = sorted([min_j, max_j])
+
+        min_i = max(0, min_i - 1)
+        max_i = min(H - 1, max_i + 1)
+        min_j = max(0, min_j - 1)
+        max_j = min(W - 1, max_j + 1)
+
+        for i in range(min_i, max_i + 1):
+            for j in range(min_j, max_j + 1):
+                wx, wy = self._grid_to_world(i, j, cx, cy)
+                if self._point_in_poly((wx, wy), poly):
+                    if C >= 2:
+                        raster[1, i, j] = 1.0
+                    if C >= 3 and is_cav > 0.5:
+                        raster[2, i, j] = 1.0
+                    if C >= 4:
+                        raster[3, i, j] = max(raster[3, i, j], v_norm)
+                    if C >= 5:
+                        raster[4, i, j] = max(raster[4, i, j], in_junc)
+
+
+
+    def get_avail_actions(self):
+        # currently assume all vehicles have the same available actions
+        # [accelerate, keep constant speed, decelerate]
+        avail_actions = []
+        # =============== mask the actions by some rules, similar to the oracle information ============ #
+        if len(self.CAVs_id_list) <= self.total_agents:
+            for idx, id in enumerate(self.CAVs_id_list):
+                avail_action = self.get_avail_agent_actions_general_signal(agent_id=id) if self.use_virtual_signal \
+                    else self.get_avail_agent_actions_no_mask(agent_id=id)
+                # print(id, avail_action)
+                avail_actions.append(avail_action)
+        # print(avail_actions)
+        # for the rest of the non-controlled vehicles
+        for i in range(self.total_agents):
+            if str(i) in self.CAVs_id_list:
+                continue
+            else:
+                avail_actions.append(np.array([1 for _ in range(self.action_dim_per_veh)], dtype=np.int32).tolist())
+        return avail_actions  # [1 1 1]
+
+    def get_avail_agent_actions_no_mask(self, agent_id):
+        # agent_id: str
+        # todo: agent_id never used
+        """ Returns the available actions for agent_id """
+        # avail_actions correspond to:
+        # [smaller_accel, small_accel, big_accel, 0, -|smaller_accel|, -|small_accel|, -|big_accel|]
+        # agent_id = str(agent_str_id)
+        # agent_index = self.CAVs_id_list.index(agent_id)
+        avail_actions = np.array([1 for _ in range(self.action_dim_per_veh)], dtype=np.int32)
+        return avail_actions
+
+    # def get_avail_agent_actions(self, agent_id):
+    #     # agent_id: str
+    #     # todo: agent_id never used
+    #     """ Returns the available actions for agent_id """
+    #     # avail_actions correspond to:
+    #     # [smaller_accel, small_accel, big_accel, 0, -|smaller_accel|, -|small_accel|, -|big_accel|]
+    #     # agent_id = str(agent_str_id)
+    #     # agent_index = self.CAVs_id_list.index(agent_id)
+    #     avail_actions = np.array([1 for _ in range(self.action_dim_per_veh)], dtype=np.int32)
+    #     min_danger_dist = 1.5 * self.safe_dist
+    #     may_danger_dist = 2.0 * self.safe_dist
+    #     fast_pass_dist = 3.5 * self.safe_dist  # fast pass the intersection
+    #     # currently assume all vehicles have the same available actions
+    #     # higher-level decision:
+    #     avail_actions_tmp = np.array([0 for _ in range(self.action_dim_per_veh)])
+    #     # if agent_id not in self.curr_ID_list:
+    #     #     return avail_actions
+    #     if (self.leave_flag_dict[agent_id]):  # if agent leaves the intersection
+    #         avail_actions_tmp[int(self.action_dim_per_veh / 2)] = 1  # keep the current speed
+    #         avail_actions = avail_actions_tmp.copy()
+    #         return avail_actions
+    #     within_intersection = self.enter_flag_dict[agent_id] and (not self.leave_flag_dict[agent_id])
+    #     not_enter_intersection = (not self.enter_flag_dict[agent_id]) and (not self.leave_flag_dict[agent_id])
+    #     # Before the vehicle enters the junction zone:
+    #     keep_speed_indx = int(self.action_dim_per_veh / 2)
+    #     if not_enter_intersection:
+    #         if agent_id in self.virtual_signal_veh_pair[0]:
+    #             if 0 <= self.step_num < self.signal_cycle_num / self.time_step:
+    #                 avail_actions_tmp[keep_speed_indx - 2: keep_speed_indx] = 1  # accelerate with bigger accelerations
+    #                 avail_actions = avail_actions_tmp.copy()
+    #             elif self.step_num >= 1 * (self.signal_cycle_num / self.time_step):
+    #                 avail_actions_tmp[0] = 1  # drive with smaller accelerations
+    #                 avail_actions_tmp[keep_speed_indx] = 1  # or keep the speed
+    #                 avail_actions = avail_actions_tmp.copy()
+    #         elif agent_id in self.virtual_signal_veh_pair[1]:
+    #             if 1 * (self.signal_cycle_num / self.time_step) <=\
+    #                     self.step_num < 2 * (self.signal_cycle_num / self.time_step):
+    #                 avail_actions_tmp[keep_speed_indx - 2: keep_speed_indx] = 1  # accelerate with bigger accelerations
+    #                 avail_actions = avail_actions_tmp.copy()
+    #             elif self.step_num >= 2 * (self.signal_cycle_num / self.time_step):
+    #                 # avail_actions_tmp[0] = 1  # drive with several smaller accelerations
+    #                 avail_actions_tmp[keep_speed_indx] = 1  # or keep the speed
+    #                 avail_actions = avail_actions_tmp.copy()
+    #             elif self.step_num < 1 * (self.signal_cycle_num / self.time_step):
+    #                 avail_actions_tmp[keep_speed_indx: 2 * keep_speed_indx] = 1  # keep the current speed or decelerate
+    #                 avail_actions = avail_actions_tmp.copy()
+    #         elif agent_id in self.virtual_signal_veh_pair[2]:
+    #             if 2 * (self.signal_cycle_num / self.time_step) <=\
+    #                     self.step_num < 3 * (self.signal_cycle_num / self.time_step):
+    #                 avail_actions_tmp[keep_speed_indx - 2: keep_speed_indx] = 1  # accelerate with bigger accelerations
+    #                 avail_actions = avail_actions_tmp.copy()
+    #             elif self.step_num >= 3 * (self.signal_cycle_num / self.time_step):
+    #                 # avail_actions_tmp[0] = 1  # drive with several smaller accelerations
+    #                 avail_actions_tmp[keep_speed_indx] = 1  # or keep the speed
+    #                 avail_actions = avail_actions_tmp.copy()
+    #             elif self.step_num < 2 * (self.signal_cycle_num / self.time_step):
+    #                 avail_actions_tmp[keep_speed_indx: 2 * keep_speed_indx] = 1  # keep the current speed or decelerate
+    #                 avail_actions = avail_actions_tmp.copy()
+    #         elif agent_id in self.virtual_signal_veh_pair[3]:
+    #             if 3 * (self.signal_cycle_num / self.time_step) <=\
+    #                     self.step_num < 4 * (self.signal_cycle_num / self.time_step):
+    #                 avail_actions_tmp[keep_speed_indx - 1] = 1  # accelerate with bigger accelerations
+    #                 avail_actions = avail_actions_tmp.copy()
+    #             elif self.step_num >= 4 * (self.signal_cycle_num / self.time_step):
+    #                 # avail_actions_tmp[0] = 1  # drive with several smaller accelerations
+    #                 avail_actions_tmp[keep_speed_indx] = 1  # or keep the speed
+    #                 avail_actions = avail_actions_tmp.copy()
+    #             elif self.step_num < 3 * (self.signal_cycle_num / self.time_step):
+    #                 avail_actions_tmp[keep_speed_indx: 2 * keep_speed_indx] = 1  # keep the current speed or with decent decelerations
+    #                 avail_actions = avail_actions_tmp.copy()
+    #         return avail_actions
+    #
+    #     # After the vehicle enters the junction zone:
+    #     # 1. wait when CAV drives into the danger zone (decelerate with max deceleration);
+    #     if within_intersection:
+    #         if self._within_danger_zone_at_intersection(vehID=agent_id, safe_distance=min_danger_dist) and \
+    #                 traci.vehicle.getSpeed(agent_id) > 0.1 * self.max_speed:
+    #             # if vehicles are in the dangerous zone, it must decelerate with max deceleration
+    #             avail_actions_tmp[-1] = 1
+    #             avail_actions = avail_actions_tmp.copy()
+    #
+    #         # 2. if intersection is crowded, CAV drives slowly;
+    #         # elif self._within_danger_zone_at_intersection(vehID=agent_id, safe_distance=may_danger_dist) and \
+    #         #         0.2 * self.max_speed > traci.vehicle.getSpeed(agent_id) >= 0.1 * self.max_speed:
+    #         #     avail_actions_tmp[-int(self.action_dim_per_veh / 2)] = 1  # keep the speed
+    #         #     avail_actions = avail_actions_tmp.copy()
+    #         # elif self._within_danger_zone_at_intersection(vehID=agent_id, safe_distance=may_danger_dist) and \
+    #         #         0.5 * self.max_speed > traci.vehicle.getSpeed(agent_id) >= 0.2 * self.max_speed:
+    #         #     avail_actions_tmp[-int(self.action_dim_per_veh / 2) + 1] = 1  # decelerate with medium deceleration
+    #         #     avail_actions = avail_actions_tmp.copy()
+    #         # 3. if safe, pass the junction as fast as it can.
+    #         elif self._within_danger_zone_at_intersection(vehID=agent_id, safe_distance=fast_pass_dist) and \
+    #                 traci.vehicle.getSpeed(agent_id) < 0.5 * self.max_speed:
+    #             avail_actions_tmp[int(self.action_dim_per_veh / 2) - 1] = 1  # drive fastest
+    #             avail_actions = avail_actions_tmp.copy()
+    #         else:
+    #             avail_actions = [1 for _ in range(2)] + [0 for _ in range(self.action_dim_per_veh - 2)]
+    #         # print(agent_id, avail_actions)
+    #         return avail_actions
+    #     return avail_actions
+    #     # todo: when the vehicles enter the intersection, we extend their action spaces
+
+    def get_avail_agent_actions_general_signal(self, agent_id):
+        # agent_id: str
+        # todo: agent_id never used
+        """ Returns the available actions for agent_id """
+        # avail_actions correspond to:
+        # [smaller_accel, small_accel, big_accel, 0, -|smaller_accel|, -|small_accel|, -|big_accel|]
+        # agent_id = str(agent_str_id)
+        # agent_index = self.CAVs_id_list.index(agent_id)
+        avail_actions = np.array([1 for _ in range(self.action_dim_per_veh)], dtype=np.int32)
+        min_danger_dist = 1.5 * self.safe_dist
+        may_danger_dist = 2.0 * self.safe_dist
+        fast_pass_dist = 3.5 * self.safe_dist  # fast pass the intersection
+        # currently assume all vehicles have the same available actions
+        # higher-level decision:
+        avail_actions_tmp = np.array([0 for _ in range(self.action_dim_per_veh)])
+        # if agent_id not in self.curr_ID_list:
+        #     return avail_actions
+        if (self.leave_flag_dict[agent_id]):  # if agent leaves the intersection
+            avail_actions_tmp[int(self.action_dim_per_veh / 2)] = 1  # keep the current speed
+            avail_actions = avail_actions_tmp.copy()
+            return avail_actions
+        within_intersection = self.enter_flag_dict[agent_id] and (not self.leave_flag_dict[agent_id])
+        not_enter_intersection = (not self.enter_flag_dict[agent_id]) and (not self.leave_flag_dict[agent_id])
+        # Before the vehicle enters the junction zone:
+        keep_speed_indx = int(self.action_dim_per_veh / 2)
+        route = self.selected_routes_of_vehicles[agent_id][0]
+        if not_enter_intersection:
+            # if self._within_danger_zone_before_intersection(vehID=agent_id, safe_distance=min_danger_dist) and \
+            #         traci.vehicle.getSpeed(agent_id) > 0.1 * self.max_speed:
+            #     avail_actions_tmp[keep_speed_indx + 1:] = 1
+            #     avail_actions = avail_actions_tmp.copy()
+            #     return avail_actions
+
+            if route in self.virtual_signal_veh_pair_general[0]:
+                if 0 <= self.step_num < self.signal_cycle_num / self.time_step:
+                    avail_actions_tmp[keep_speed_indx - 2: keep_speed_indx] = 1  # accelerate with bigger accelerations
+                    avail_actions = avail_actions_tmp.copy()
+                elif self.step_num >= 1 * (self.signal_cycle_num / self.time_step):
+                    avail_actions_tmp[0] = 1  # drive with smaller accelerations
+                    avail_actions_tmp[keep_speed_indx] = 1  # or keep the speed
+                    avail_actions = avail_actions_tmp.copy()
+            elif route in self.virtual_signal_veh_pair_general[1]:
+                if 1 * (self.signal_cycle_num / self.time_step) <= \
+                        self.step_num < 2 * (self.signal_cycle_num / self.time_step):
+                    avail_actions_tmp[keep_speed_indx - 2: keep_speed_indx] = 1  # accelerate with bigger accelerations
+                    avail_actions = avail_actions_tmp.copy()
+                elif self.step_num >= 2 * (self.signal_cycle_num / self.time_step):
+                    # avail_actions_tmp[0] = 1  # drive with several smaller accelerations
+                    avail_actions_tmp[keep_speed_indx] = 1  # or keep the speed
+                    avail_actions = avail_actions_tmp.copy()
+                elif self.step_num < 1 * (self.signal_cycle_num / self.time_step):
+                    avail_actions_tmp[keep_speed_indx: 2 * keep_speed_indx] = 1  # keep the current speed or decelerate
+                    avail_actions = avail_actions_tmp.copy()
+            elif route in self.virtual_signal_veh_pair_general[2]:
+                if 2 * (self.signal_cycle_num / self.time_step) <= \
+                        self.step_num < 3 * (self.signal_cycle_num / self.time_step):
+                    avail_actions_tmp[keep_speed_indx - 2: keep_speed_indx] = 1  # accelerate with bigger accelerations
+                    avail_actions = avail_actions_tmp.copy()
+                elif self.step_num >= 3 * (self.signal_cycle_num / self.time_step):
+                    # avail_actions_tmp[0] = 1  # drive with several smaller accelerations
+                    avail_actions_tmp[keep_speed_indx] = 1  # or keep the speed
+                    avail_actions = avail_actions_tmp.copy()
+                elif self.step_num < 2 * (self.signal_cycle_num / self.time_step):
+                    avail_actions_tmp[keep_speed_indx: 2 * keep_speed_indx] = 1  # keep the current speed or decelerate
+                    avail_actions = avail_actions_tmp.copy()
+            elif route in self.virtual_signal_veh_pair_general[3]:
+                if 3 * (self.signal_cycle_num / self.time_step) <= \
+                        self.step_num < 4 * (self.signal_cycle_num / self.time_step):
+                    avail_actions_tmp[keep_speed_indx - 1] = 1  # accelerate with bigger accelerations
+                    avail_actions = avail_actions_tmp.copy()
+                elif self.step_num >= 4 * (self.signal_cycle_num / self.time_step):
+                    # avail_actions_tmp[0] = 1  # drive with several smaller accelerations
+                    avail_actions_tmp[keep_speed_indx] = 1  # or keep the speed
+                    avail_actions = avail_actions_tmp.copy()
+                elif self.step_num < 3 * (self.signal_cycle_num / self.time_step):
+                    avail_actions_tmp[
+                    keep_speed_indx: 2 * keep_speed_indx] = 1  # keep the current speed or with decent decelerations
+                    avail_actions = avail_actions_tmp.copy()
+            return avail_actions
+
+        # After the vehicle enters the junction zone:
+        # 1. wait when CAV drives into the danger zone (decelerate with max deceleration);
+        if within_intersection:
+            if self._within_danger_zone_at_intersection(vehID=agent_id, safe_distance=min_danger_dist) and \
+                    traci.vehicle.getSpeed(agent_id) > 0.1 * self.max_speed:
+                # if vehicles are in the dangerous zone, it must decelerate with max deceleration
+                avail_actions_tmp[-1] = 1
+                avail_actions = avail_actions_tmp.copy()
+
+            # 2. if intersection is crowded, CAV drives slowly;
+            # elif self._within_danger_zone_at_intersection(vehID=agent_id, safe_distance=may_danger_dist) and \
+            #         0.2 * self.max_speed > traci.vehicle.getSpeed(agent_id) >= 0.1 * self.max_speed:
+            #     avail_actions_tmp[-int(self.action_dim_per_veh / 2)] = 1  # keep the speed
+            #     avail_actions = avail_actions_tmp.copy()
+            # elif self._within_danger_zone_at_intersection(vehID=agent_id, safe_distance=may_danger_dist) and \
+            #         0.5 * self.max_speed > traci.vehicle.getSpeed(agent_id) >= 0.2 * self.max_speed:
+            #     avail_actions_tmp[-int(self.action_dim_per_veh / 2) + 1] = 1  # decelerate with medium deceleration
+            #     avail_actions = avail_actions_tmp.copy()
+            # 3. if safe, pass the junction as fast as it can.
+            elif self._within_danger_zone_at_intersection(vehID=agent_id, safe_distance=fast_pass_dist) and \
+                    traci.vehicle.getSpeed(agent_id) < 0.5 * self.max_speed:
+                avail_actions_tmp[int(self.action_dim_per_veh / 2) - 1] = 1  # drive fastest
+                avail_actions = avail_actions_tmp.copy()
+            else:
+                avail_actions = [1 for _ in range(2)] + [0 for _ in range(self.action_dim_per_veh - 2)]
+            # print(agent_id, avail_actions)
+            return avail_actions
+        return avail_actions
+        # todo: when the vehicles enter the intersection, we extend their action spaces
+
+    def get_total_actions(self):
+        """ Returns the total number of actions an agent could ever take """
+        # TODO: This is only suitable for a discrete 1 dimensional action space for each agent
+        return self.action_dim_per_veh if self.discrete else 1
+
+    def reset(self, env_args=None):
+        """ Returns initial observations and states"""
+        print(self.intention_probs)
+        if self.episode_num == 0:
+            if self.run_curricula:
+                self.random_behavior = env_args["random_behavior"]
+                self.comm_lag = env_args["comm_lag"]
+                self.n_agents = env_args["n_agents"]
+                self.CAVs_id_list = env_args["CAVs_id_list"]
+                self.intention_probs = env_args["intention_probs"]
+            # if self.phase is not None:
+            #     self.comm_lag = self.comm_lag_curricula[self.phase]
+            self.first_start()
+            self.episode_num += 1
+        else:
+            self.done = False
+            self.step_num = 0
+            self.episode_num += 1
+            # self.control_len = 1/2 * self.lane_length
+            # self.enter_flag_list_tmp = [False for _ in range(self.n_agents)]
+            # self.leave_flag_list_tmp = [False for _ in range(self.n_agents)]
+            # self.enter_flag_list = [False for _ in range(self.n_agents)]
+            # self.leave_flag_list = [False for _ in range(self.n_agents)]
+            self.veh_intentions = OrderedDict({})
+            self.env_infos = {"complete_flag": float(False), "collisions": 0.0}
+            self.enter_flag_dict_tmp = {str(t): False for t in range(self.total_agents)}
+            self.leave_flag_dict_tmp = {str(t): False for t in range(self.total_agents)}
+            self.enter_flag_dict = {str(t): False for t in range(self.total_agents)}
+            self.leave_flag_dict = {str(t): False for t in range(self.total_agents)}
+            self.selected_routes_of_vehicles = OrderedDict({vehID: [] for vehID in self.CAVs_id_list})
+            self.complete_flag = False
+            traci.load(self.reloadCmd)
+            self.shape_intersection = traci.junction.getShape('J1')
+            self.len_intersection = 2 * max([max(ele) for ele in self.shape_intersection])
+            self.lane_length = [traci.lane.getLength(id) for id in self.lane_ids][
+                0]  # assume all lanes share the same length
+            if self.run_curricula:
+                self.random_behavior = env_args["random_behavior"]
+                self.comm_lag = env_args["comm_lag"]
+                self.n_agents = env_args["n_agents"]
+                self.CAVs_id_list = env_args["CAVs_id_list"]
+            # if self.phase is not None:
+            #     self.comm_lag = self.comm_lag_curricula[self.phase]
+
+            self._spawn_CAVs_in_sumo(random_behavior=self.random_behavior)
+            traci.simulationStep()  # avoid all zero observations
+            self.obs_temp = {"pos": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                             "speed": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                             "min_dist": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                             "wt": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                             "enter_flag": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                             "leave_flag": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                             }
+
+            self._prev_conflict_I = {vid: 0.0 for vid in self.CAVs_id_list}
+
+            self._update_info()
+            self.curr_ID_list = traci.vehicle.getIDList()
+            # obs = self.get_obs()
+        # return obs
+
+    def _set_enter_and_leave_flags(self):
+        # assign true flag to enter_flag_list from tmp variable
+        for id_idx, id in enumerate(self.CAVs_id_list):
+            if id not in self.curr_ID_list:  # if one CAV goes out of scope, continue.
+                continue
+            self._if_veh_enters_the_junction(vehID=id)  # set tmp variable
+            # self.enter_flag_list = self.enter_flag_list_tmp.copy()
+            if self.enter_flag_dict_tmp[id]:
+                self.enter_flag_dict[id] = True
+            # ------------------------------------------ #
+            if self.enter_flag_dict[id]:  # the vehicle has entered the intersection
+                self._if_veh_leaves_the_junction(id)
+                if self.leave_flag_dict_tmp[id]:
+                    self.leave_flag_dict[id] = True
+
+    def first_start(self):
+        # self.sumoCmd[0] = 'sumo-gui'
+        traci.start(self.sumoCmd)
+        self.shape_intersection = traci.junction.getShape('J1')
+        self.len_intersection = 2 * max([max(ele) for ele in self.shape_intersection])
+        self.lane_length = [traci.lane.getLength(id) for id in self.lane_ids][0]  # assume all lanes share the same length
+        # add CAVs
+        self._spawn_CAVs_in_sumo(random_behavior=self.random_behavior)
+        traci.simulationStep()  # avoid all zero observations
+        self.obs_temp = {"pos": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "speed": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "min_dist": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "wt": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "enter_flag": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         "leave_flag": {str(t): deque(maxlen=100) for t in range(self.total_agents)},
+                         }
+        self.env_infos = {"complete_flag": float(False), "collisions": 0.0}
+        self.step_num = 0
+        self.lane_length = [traci.lane.getLength(id) for id in self.lane_ids][
+            0]  # assume all lanes share the same length
+        self.lane_width = [traci.lane.getWidth(id) for id in self.lane_ids][0]  # assume all lanes share the same length
+        self.control_len = 1 / 2 * self.lane_length
+        self.curr_ID_list = traci.vehicle.getIDList()
+        self.complete_flag = False
+        self._update_info()
+        # return self.get_obs()
+
+    def _spawn_CAVs_in_sumo(self, random_behavior=False):
+        if self.n_agents <= self.total_agents:
+            for i in self.CAVs_id_list:  # i is of string type
+                self._add_vehicle_in_sumo(i, if_cav=True, random_behavior=random_behavior)
+                # traci.simulationStep()
+        # for the rest of the vehicles:
+        for i in range(self.total_agents):
+            if str(i) in self.CAVs_id_list:
+                continue
+            else:
+                self._add_vehicle_in_sumo(str(i), if_cav=False, random_behavior=random_behavior)
+
+    def _add_vehicle_in_sumo(self, vehID, if_cav=True, random_behavior=False):
+        intention = np.random.choice([i for i in range(self.intention_dim)], p=self.intention_probs)
+        self.veh_intentions[vehID] = intention
+        routes = self.routes_of_vehicles[vehID][intention] if random_behavior else self.routes_fixed[vehID]
+        self.selected_routes_of_vehicles[vehID].append(routes)
+        traci.vehicle.add(vehID, routes, typeID=self.type_name,
+                          depart=self.vehicle_spawn_infos["depart"],
+                          departPos=self.vehicle_spawn_infos["departPos"],
+                          departLane=self.CAVs_departLane[vehID][-1],
+                          departSpeed=self.vehicle_spawn_infos["departSpeed"])
+        if if_cav:
+            traci.vehicle.setColor(vehID, ['255', '0', '0'])
+
+    def _get_rewards(self, next_observations):
+        rewards = [0 for _ in range(self.n_agents)]
+        for idx, id in enumerate(self.CAVs_id_list):
+            if id in self.curr_ID_list:
+                if next_observations[idx][-1] < 0.1:
+                    rewards[idx] -= 5
+                rewards[idx] += next_observations[idx][-1]
+                if self._within_danger_zone_at_intersection(index=idx, vehID=id):
+                    rewards[idx] -= 10
+        return rewards
+
+    def _derive_accel_from_chosen_actions_idxes(self, vehID, actions_idxes):
+        # vehID : int
+        # max_speed = traci.vehicle.getMaxSpeed(vehID)
+        action_idx = np.array(actions_idxes[int(vehID)])  # one-hot vector
+        # effective_action_idx = np.argwhere(action==1).reshape(-1)
+        if (action_idx >= 0) and (action_idx <= int(((self.action_dim_per_veh - 1) / 2 - 1))):  # accel
+            accel = self.accel_res[int(action_idx)]
+        elif action_idx == (self.action_dim_per_veh - 1) / 2:  # keep current speed
+            accel = 0
+        elif (action_idx >= (self.action_dim_per_veh - 1) / 2 + 1) and (
+                action_idx <= self.action_dim_per_veh - 1):  # decel
+            accel = -self.accel_res[int(action_idx) - self.action_dim_per_veh]
+        # print('accel is: ',accel)
+        return accel
+
+    def _get_shared_reward(self, next_observations):
+        reward = 0
+        # wt_list = []
+        wt = 0
+        self.v_threshold = 2 / self.max_speed
+        if_danger_dict = {t: False for t in self.CAVs_id_list}
+
+        # 速度过慢、小安全距惩罚
+        for idx, vid in enumerate(self.CAVs_id_list):
+            if vid in self.curr_ID_list:
+                # ---------- quickly through the intersection -------------#
+                v = traci.vehicle.getSpeed(vid)
+                v_norm = float(v / self.max_speed)
+                if v_norm < self.v_threshold:
+                    reward -= 0.5
+                # ====== reward acceleration =======#
+                # else:
+                #     reward += next_observations[idx][self.vel_end_idx - 1] - self.v_threshold
+                # --------------- collision test given the safe distance -------------#
+                danger = self._within_danger_zone_at_intersection(vehID=vid, safe_distance=self.safe_dist)
+                if_danger_dict[vid] = danger
+                if danger:
+                    reward -= 5
+        # --------------------- penalize long waiting time -------------------#
+        for id in self.lane_ids:
+            wt += traci.lane.getWaitingTime(id)
+        # wt_list.append(wt)
+        reward -= 0.05 * wt
+        # --------------------- Need less time to achieve the task -------------------#
+        reward -= 0.005
+        # print(self.step_num, wt)
+        # --------------------- if task is successfully completed ------------------#
+        """Explanation of this case: all vehicles leave the intersection without near collisions"""
+        enter_flags, leave_flags = [], []
+        for id in self.CAVs_id_list:
+            enter_flags.append(self.enter_flag_dict[id])
+            leave_flags.append(self.leave_flag_dict[id])
+        if all(enter_flags) and all(leave_flags) and \
+                traci.simulation.getCollidingVehiclesNumber() == 0:
+            reward += (self.episode_limit - self.step_num) + 20
+            # reward += len(self.CAVs_id_list) * 10
+            self.complete_flag = True
+            self.env_infos["complete_flag"] = float(self.complete_flag)
+        # elif True not in if_danger_list and all(self.leave_flag_list) and self.step_num <= int(self.episode_limit):
+        #     reward += 100
+        # ---------------- Encourage more vehicles pass through the intersection ------------------#
+        # vehicles_through_step = 0
+        # for i, flag in enumerate(self.leave_flag_list):
+        #     if flag == True and not if_danger_list[i]:
+        #         vehicles_through_step += 1
+        # vehicles_through = vehicles_through_step - self.vehicles_through
+        # self.vehicles_through = vehicles_through_step
+        # # print(vehicles_through)
+        # reward += vehicles_through
+        # ------------ Penalize the case when there are vehicles not passing through the intersection ------------#
+        vehicles_through_step = 0
+        # for id, flag in self.leave_flag_dict.items():
+        for id in self.CAVs_id_list:
+            flag = self.leave_flag_dict[id]
+            if flag is True and not if_danger_dict[id]:
+                vehicles_through_step += 1
+        vehicles_through = vehicles_through_step - self.vehicles_through
+        self.vehicles_through = vehicles_through_step
+        # print(vehicles_through)
+        # veh_not_through = self.n_agents - vehicles_through_step
+        # reward -= 0.01 * veh_not_through
+        reward += 0.1 * vehicles_through
+        return reward
+
+    def _get_done(self):
+        # ------------- basic decision of termination of an episode -------------#
+        done = self.done
+        if done:  # if the initial done condition is true
+            return done
+        if () in self.curr_ID_list and self.step_num > 4:
+            done = True
+        # ------------ decide if the waiting time is too long --------------#
+        wt = 0
+        for id in self.lane_ids:
+            wt += traci.lane.getWaitingTime(id)
+        if wt > self.waiting_steps_threshold:
+            done = True
+        # ------------- vehicles do not collide with each other at intersection --------#
+        # for id in self.CAVs_id_list:
+        #     if id not in self.curr_ID_list:
+        #         continue
+        #     if self._within_danger_zone_at_intersection(id, safe_distance=self.safe_dist):
+        #         done = True
+        if traci.simulation.getCollidingVehiclesNumber():
+            done = True
+            self.collision_times = traci.simulation.getCollidingVehiclesNumber()
+            self.env_infos["collisions"] = self.collision_times
+        # -------------- decide if all cars leave the intersection --------#
+        leave_flags = []
+        for id in self.CAVs_id_list:
+            leave_flags.append(self.leave_flag_dict[id])
+        if all(leave_flags):
+            done = True
+        # ----------- decide if step_num is beyond the scope  -----------#
+        if self.step_num >= self.episode_limit:
+            done = True
+        return done
+
+    # def _is_success(self):
+    #     if all(self.leave_flag_list) and traci.simulation.getCollidingVehiclesNumber() == 0:
+    #         return True
+    def _get_distance_list_between_ego_and_other_vehicles(self, vehID, exclude_same_phase=False):
+        dist_list = []
+        pos0 = np.array(traci.vehicle.getPosition(vehID))
+        # for the case including all the vehicles
+        if not exclude_same_phase:
+            for id in self.curr_ID_list:
+                if id != vehID:
+                    pos1 = np.array(traci.vehicle.getPosition(id))
+                    dist = np.linalg.norm(pos0 - pos1)
+                    dist_list.append(dist)
+            return dist_list
+
+        # for the case EXCLUDING all the vehicles
+        ego_route = traci.vehicle.getRouteID(vehID)
+        phase_id = None
+        for (phase_num, routes) in self.virtual_signal_veh_pair_general.items():
+            if ego_route in routes:
+                phase_id = phase_num
+                break
+        cur_ID_list = list(self.curr_ID_list).copy()
+        # delete the unrelated vehicles
+        for id in self.curr_ID_list:
+            cur_route = traci.vehicle.getRouteID(id)
+            if cur_route in self.virtual_signal_veh_pair_general[phase_id]:
+                cur_ID_list.remove(id)
+
+        for id in cur_ID_list:
+            if id != vehID:
+                pos1 = np.array(traci.vehicle.getPosition(id))
+                dist = np.linalg.norm(pos0 - pos1)
+                dist_list.append(dist)
+        return dist_list
+
+    # def _get_distance_list_between_ego_and_other_vehicles(self, vehID, exclude_same_phase=False):
+    #     dist_list = []
+    #     pos0 = np.array(traci.vehicle.getPosition(vehID))
+    #     vehID_in_same_phase = self.same_directions[vehID]
+    #     for id in self.curr_ID_list:
+    #         if exclude_same_phase:
+    #             if vehID_in_same_phase == id:
+    #                 continue
+    #         if id != vehID:
+    #             pos1 = np.array(traci.vehicle.getPosition(id))
+    #             dist = np.linalg.norm(pos0 - pos1)
+    #             dist_list.append(dist)
+    #     return dist_list
+
+    def _get_ego_dist_list_vehicles_exclude_latters_before_intersection(self, vehID, exclude_same_direction=False):
+        dist_list = []
+        pos0 = np.array(traci.vehicle.getPosition(vehID))
+        vehIDs_in_same_lane = list(traci.lane.getLastStepVehicleIDs(self.CAVs_departLane[vehID])) # include vehID
+        vehID_same_direction = self.same_directions[vehID] # vehicles in differen lane but the same direction
+        vehIDs_same_road_diff_lane = list(traci.lane.getLastStepVehicleIDs(self.CAVs_departLane[vehID_same_direction]))
+        # split the list
+        if vehID in vehIDs_in_same_lane:
+            split_index = vehIDs_in_same_lane.index(vehID)
+            excluded_ids = vehIDs_in_same_lane[:split_index]
+            excluded_ids.extend(vehIDs_same_road_diff_lane)
+            for id in self.curr_ID_list:
+                if id != vehID:
+                    if exclude_same_direction:
+                        if id in excluded_ids:
+                            continue
+                    pos1 = np.array(traci.vehicle.getPosition(id))
+                    dist = np.linalg.norm(pos0 - pos1)
+                    dist_list.append(dist)
+        return dist_list
+
+    def _within_danger_zone_at_intersection(self, vehID, safe_distance=3.0):
+        # vehID: str
+        # distance_matrix = self._get_distance_matrix_between_any_2_vehicles_with_repeat()
+        within_intersection = self.enter_flag_dict[vehID] and (not self.leave_flag_dict[vehID])
+        # logging.info('If all vehicles are within the intersection: '+ str(within_intersection))
+        dist_list = self._get_distance_list_between_ego_and_other_vehicles(vehID, exclude_same_phase=True)
+        # print(dist_list)
+        if not dist_list:  # if only one car is left, then it has no danger
+            within_intersection = False
+        within_danger_zone = False
+        if within_intersection:
+            dist = min(dist_list)
+            # print(vehID, dist)
+            if dist <= safe_distance:
+                within_danger_zone = True
+        return within_danger_zone
+
+    def _within_danger_zone_before_intersection(self, vehID, safe_distance=3.0):
+        # vehID: str
+        # distance_matrix = self._get_distance_matrix_between_any_2_vehicles_with_repeat()
+        # logging.info('If all vehicles are within the intersection: '+ str(within_intersection))
+        # not_in_intersection = not self.enter_flag_dict[vehID] and (not self.leave_flag_dict[vehID])
+        # dist_list = []
+        # if not_in_intersection:
+        dist_list = self._get_ego_dist_list_vehicles_exclude_latters_before_intersection(vehID,
+                                                                                         exclude_same_direction=True)
+        # print(dist_list)
+        if not dist_list:  # if only one car is left, then it has no danger
+            return False
+        within_danger_zone = False
+        dist = min(dist_list)
+        # print(vehID, ": ", dist)
+        if dist <= safe_distance:
+            within_danger_zone = True
+        return within_danger_zone
+
+    def _if_veh_enters_the_junction(self, vehID):
+        # vehID: str
+        # veh_index = self.CAVs_id_list.index(vehID)
+        curr_lane_id = traci.vehicle.getLaneID(vehID)
+        if self.junction_name in curr_lane_id:
+            self.enter_flag_dict_tmp[vehID] = True
+
+    def _if_veh_leaves_the_junction(self, vehID):  # must be used after vehicle enters the intersection zone
+        # veh_index = self.CAVs_id_list.index(vehID)
+        curr_lane_id = traci.vehicle.getLaneID(vehID)
+        if self.junction_name not in curr_lane_id:
+            self.leave_flag_dict_tmp[vehID] = True
+
+    def render(self):
+        raise NotImplementedError
+
+    def close(self):
+        traci.close(wait=False)
+        self.episode_num = 0
+        # raise NotImplementedError
+
+    # def seed(self, seed=None):
+    #     self.np_random, self.seed = gym.utils.seeding.np_random(self.seed)
+    #     return [seed]
+
+    def save_replay(self):
+        raise NotImplementedError

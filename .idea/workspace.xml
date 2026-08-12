@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ChangeListManager">
+    <list default="true" id="1c0b8e39-fda7-422c-be88-11c92c589ba1" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/src/pretext/loss.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/pretext/loss.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pretext/pretext_models/cvae_model.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/pretext/pretext_models/cvae_model.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pretext/pretext_models/decoders.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/pretext/pretext_models/decoders.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pretext/pretext_models/pretext_rnn_base.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/pretext/pretext_models/pretext_rnn_base.py" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$/src/pretext" />
+  </component>
+  <component name="MarkdownSettingsMigration">
+    <option name="stateVersion" value="1" />
+  </component>
+  <component name="ProjectId" id="391X5JvFXI2M16CTmFDGll2psnJ" />
+  <component name="ProjectLevelVcsManager" settingsEditedManually="true" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "RunOnceActivity.OpenProjectViewOnStart": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "WebServerToolWindowFactoryState": "true",
+    "last_opened_file_path": "/home/ljy/2"
+  }
+}]]></component>
+  <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="1c0b8e39-fda7-422c-be88-11c92c589ba1" name="Changes" comment="" />
+      <created>1769864366478</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1769864366478</updated>
+      <workItem from="1769864367785" duration="290000" />
+    </task>
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+</project>
